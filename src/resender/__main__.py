@@ -9,6 +9,8 @@ import html
 import os
 from dotenv import load_dotenv
 
+from src.utils.fast_telethon import parallel_upload
+
 load_dotenv()
 
 input_folder: str = "backup_will_be_inside_me"
@@ -26,13 +28,18 @@ async def main():
         api_id_env = os.getenv("API_ID")
         api_hash_env = os.getenv("API_HASH")
         chat_id_env = os.getenv("DESTINATION_GROUP_ID")
+        bot_token_env = os.getenv("BOT_TOKEN")
         
         api_id = int(api_id_env) if api_id_env else int(input("Enter your api_id: "))
         api_hash = api_hash_env if api_hash_env else input("Enter your api_hash: ")
         chat_id = int(chat_id_env) if chat_id_env else int(input("Enter your DESTINATION_GROUP_ID: "))
 
-        client = TelegramClient("tg_session", api_id, api_hash)
-        await client.start()
+        if bot_token_env:
+            client = TelegramClient("tg_bot_session", api_id, api_hash)
+            await client.start(bot_token=bot_token_env)
+        else:
+            client = TelegramClient("tg_session", api_id, api_hash)
+            await client.start()
 
         group = await client.get_entity(PeerChannel(int(chat_id)))
 
@@ -67,22 +74,8 @@ async def main():
                         message = f"<pre>❝ {quote_text} ❞</pre>"
                     has_message = True
 
-            if has_message:
-                message = str(date) + "\n\n" + str(message)
-            else:
-                message = str(date)
-
-            if from_id is not None:
-                try:
-                    user = await client.get_entity(from_id)
-                    full_name = " ".join(
-                        filter(None, [user.first_name, user.last_name]))
-                    message = f"{full_name} (@{user.username}) - http://t.me/c/{reply_to} - {message}"
-                except Exception as e:
-                    print(f"Error fetching user: {str(e)}")
-                    message = f"Unknown User - http://t.me/c/{reply_to} - {message}"
-            else:
-                message = f"Unknown User - http://t.me/c/{reply_to} - {message}"
+            # The original message variable already contains the quote and message text
+            # We will use it directly without appending the date, user, and reply link.
 
             did_send_media_msg = False
 
@@ -91,8 +84,9 @@ async def main():
                 for file_name in file_names:
                     print(f"Sending Media: {file_name}")
                     try:
+                        input_file = await parallel_upload(client, file_name)
                         await client.send_file(entity=group,
-                                               file=file_name,
+                                               file=input_file,
                                                caption=message,
                                                silent=True)
                         did_send_media_msg = True

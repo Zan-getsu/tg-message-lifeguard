@@ -52,10 +52,20 @@ To make running the scripts seamless, we use a `.env` file to store your credent
    Rename `.env.example` to `.env`.
 2. **Fill it out:**
    Open `.env` and fill in the values:
-   - `API_ID=...`
-   - `API_HASH=...`
-   - `SOURCE_GROUP_ID=...` (The channel/group you want to backup from)
-   - `DESTINATION_GROUP_ID=...` (The channel/group to upload/resend to)
+   ```ini
+API_ID=YOUR_API_ID
+API_HASH=YOUR_API_HASH
+SOURCE_GROUP_ID=-100YOUR_SOURCE_GROUP_ID
+DESTINATION_GROUP_ID=-100YOUR_DESTINATION_GROUP_ID
+BOT_TOKEN=YOUR_BOT_TOKEN
+USE_BOT_FOR_DOWNLOAD=false
+```
+
+- **`API_ID` & `API_HASH`**: Get these from [my.telegram.org](https://my.telegram.org)
+- **`SOURCE_GROUP_ID`**: The channel/group containing the deleted messages.
+- **`DESTINATION_GROUP_ID`**: The channel/group where messages will be resent.
+- **`BOT_TOKEN` (Optional)**: A Telegram Bot token. Recommended for uploading to prevent your user account from being banned.
+- **`USE_BOT_FOR_DOWNLOAD` (Optional)**: Set to `true` to also use the bot for downloading (requires adding the bot as an admin to the Source Group).
 
 ### 🔑 Steps to Obtain `API_ID` and `API_HASH`
 1. Go to the [Telegram API website](https://my.telegram.org/).

@@ -14,6 +14,9 @@ from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.tl.types import PeerChannel
 from telethon.errors import RPCError
+from telethon import utils
+
+from src.utils.fast_telethon import parallel_download, parallel_upload
 
 load_dotenv()
 
@@ -33,8 +36,7 @@ session_name: str = "tg_session"
 output_folder: str = "backup_will_be_inside_me"
 os.makedirs(output_folder, exist_ok=True)
 
-# Initialize Telegram client
-client: TelegramClient = TelegramClient(session_name, api_id, api_hash)
+# Telegram clients will be initialized in main()
 
 # Telegram restricts bot/user uploads to 2GB. We use 1.95GB for safety.
 MAX_FILE_SIZE = int(1.95 * 1024 * 1024 * 1024) 
@@ -79,7 +81,7 @@ def split_file_if_needed(filepath: str) -> list[str]:
     return part_files
 
 
-async def uploader_worker(queue: asyncio.Queue, dest_group_id: int):
+async def uploader_worker(upload_client: TelegramClient, queue: asyncio.Queue, dest_group_id: int):
     """
     Consumer task that listens for completely downloaded files and uploads them.
     """
@@ -91,7 +93,7 @@ async def uploader_worker(queue: asyncio.Queue, dest_group_id: int):
             queue.task_done()
         return
 
-    dest_entity = await client.get_entity(PeerChannel(dest_group_id))
+    dest_entity = await upload_client.get_entity(PeerChannel(dest_group_id))
 
     while True:
         item = await queue.get()
@@ -132,10 +134,6 @@ async def uploader_worker(queue: asyncio.Queue, dest_group_id: int):
             message_text = msg_obj.get("message", "")
             has_message = bool(message_text.strip())
             
-            date_str = "Unknown Date"
-            if "date" in msg_obj:
-                date_str = datetime.fromisoformat(msg_obj["date"]).strftime("%Y %b %d, %H:%M")
-
             if has_quote and quote_text:
                 quote_text_escaped = html.escape(quote_text)
                 if has_message:
@@ -144,17 +142,7 @@ async def uploader_worker(queue: asyncio.Queue, dest_group_id: int):
                     message_text = f"<pre>❝ {quote_text_escaped} ❞</pre>"
                 has_message = True
 
-            final_caption = f"{date_str}\n\n{message_text}" if has_message else str(date_str)
-
-            if from_id is not None:
-                try:
-                    user = await client.get_entity(from_id)
-                    full_name = " ".join(filter(None, [user.first_name, user.last_name]))
-                    final_caption = f"{full_name} (@{user.username}) - http://t.me/c/{reply_to} - {final_caption}"
-                except Exception:
-                    final_caption = f"Unknown User - http://t.me/c/{reply_to} - {final_caption}"
-            else:
-                final_caption = f"Unknown User - http://t.me/c/{reply_to} - {final_caption}"
+            final_caption = message_text
             
             # --- Upload Phase ---
             print(f"[Uploader] Processing message ID {message_id}...")
@@ -168,9 +156,10 @@ async def uploader_worker(queue: asyncio.Queue, dest_group_id: int):
                     caption_to_use = final_caption if idx == 0 else f"Part {idx+1} for message {message_id}"
                     print(f"[Uploader] Sending media: {file_path}")
                     try:
-                        await client.send_file(
+                        input_file = await parallel_upload(upload_client, file_path)
+                        await upload_client.send_file(
                             entity=dest_entity,
-                            file=file_path,
+                            file=input_file,
                             caption=caption_to_use,
                             silent=True,
                             parse_mode="html"
@@ -182,7 +171,7 @@ async def uploader_worker(queue: asyncio.Queue, dest_group_id: int):
             
             if has_message and not did_send_media_msg:
                 try:
-                    await client.send_message(
+                    await upload_client.send_message(
                         entity=dest_entity,
                         message=final_caption,
                         silent=True,
@@ -199,6 +188,8 @@ async def uploader_worker(queue: asyncio.Queue, dest_group_id: int):
 
 
 async def export_messages(
+    download_client: TelegramClient,
+    upload_client: TelegramClient,
     source_group_id: int,
     dest_group_id: int,
     mode: int,
@@ -209,7 +200,7 @@ async def export_messages(
     """
     Exports messages and orchestrates the parallel backup and resend queues.
     """
-    group: PeerChannel = await client.get_entity(PeerChannel(source_group_id))
+    group: PeerChannel = await download_client.get_entity(PeerChannel(source_group_id))
     dump_file = os.path.join(output_folder, "dump_unified.json")
     
     file_mode: str = "a" if os.path.exists(dump_file) else "w"
@@ -223,7 +214,7 @@ async def export_messages(
         while True:
             events = [
                 event
-                async for event in client.iter_admin_log(
+                async for event in download_client.iter_admin_log(
                     group,
                     min_id=min_id or 0,
                     max_id=current_max_id,
@@ -262,9 +253,9 @@ async def export_messages(
     
     # Start the consumer task if auto-resend is on
     uploader_task = None
-    if auto_resend and dest_group_id:
+    if auto_resend and dest_group_id and upload_client:
         print("[System] Starting background Uploader worker...")
-        uploader_task = asyncio.create_task(uploader_worker(upload_queue, dest_group_id))
+        uploader_task = asyncio.create_task(uploader_worker(upload_client, upload_queue, dest_group_id))
 
     print("\n[Phase 2] Starting Parallel Downloader & Queueing...")
     
@@ -282,16 +273,18 @@ async def export_messages(
                 c += 1
                 if event.old.media:
                     m += 1
-                    file_path = os.path.join(output_folder, str(event.old.id))
-                    print(f"[Downloader] Downloading media for ID {event.old.id}...")
-                    await client.download_media(event.old.media, file_path)
+                    ext = utils.get_extension(event.old.media)
+                    file_path = os.path.join(output_folder, f"{event.old.id}{ext}")
+                    print(f"[Downloader] Downloading media for ID {event.old.id} (ext: {ext})...")
+                    await parallel_download(download_client, event.old.media, file_path)
                     downloaded_files = split_file_if_needed(file_path)
                     
             elif mode == 2 and event.old.media:
                 m += 1
-                file_path = os.path.join(output_folder, str(event.old.id))
-                print(f"[Downloader] Downloading media for ID {event.old.id}...")
-                await client.download_media(event.old.media, file_path)
+                ext = utils.get_extension(event.old.media)
+                file_path = os.path.join(output_folder, f"{event.old.id}{ext}")
+                print(f"[Downloader] Downloading media for ID {event.old.id} (ext: {ext})...")
+                await parallel_download(download_client, event.old.media, file_path)
                 downloaded_files = split_file_if_needed(file_path)
                 
             elif mode == 3 and not event.old.media:
@@ -327,7 +320,22 @@ async def main() -> None:
     
     args = parser.parse_args()
 
-    await client.start()
+    bot_token = os.getenv("BOT_TOKEN")
+    use_bot_for_download = os.getenv("USE_BOT_FOR_DOWNLOAD", "false").lower() == "true"
+    
+    user_client = None
+    bot_client = None
+    
+    if bot_token:
+        bot_client = TelegramClient("tg_bot_session", api_id, api_hash)
+        await bot_client.start(bot_token=bot_token)
+    
+    if not bot_token or not use_bot_for_download:
+        user_client = TelegramClient("tg_session", api_id, api_hash)
+        await user_client.start()
+        
+    download_client = bot_client if (bot_token and use_bot_for_download) else user_client
+    upload_client = bot_client if bot_token else user_client
     
     print("\n--- Unified Telegram Sync ---")
     
@@ -360,6 +368,8 @@ async def main() -> None:
         dest_id = int(dest_id_input)
         
     await export_messages(
+        download_client=download_client,
+        upload_client=upload_client,
         source_group_id=src_id,
         dest_group_id=dest_id,
         mode=export_mode,
