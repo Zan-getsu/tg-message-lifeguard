@@ -11,8 +11,8 @@ import json
 import glob
 from datetime import datetime
 from dotenv import load_dotenv
-from telethon import TelegramClient
-from telethon.tl.types import PeerChannel
+from telethon.sync import TelegramClient, events
+from telethon.tl.types import PeerChannel, DocumentAttributeFilename
 from telethon.errors import RPCError
 from telethon import utils
 
@@ -264,35 +264,60 @@ async def export_messages(
         m: int = 0
         
         for event in all_events:
-            event_json_str = event.old.to_json()
+            event_dict = event.old.to_dict()
             downloaded_files = []
+            should_write = False
             
             # --- Text/Media Filtering ---
-            if mode == 1:
-                dump.write(event_json_str + ",\n")
-                c += 1
+            if mode == 1: # Export All (Text + Media)
+                should_write = True
                 if event.old.media:
                     m += 1
                     ext = utils.get_extension(event.old.media)
-                    file_path = os.path.join(output_folder, f"{event.old.id}{ext}")
-                    print(f"[Downloader] Downloading media for ID {event.old.id} (ext: {ext})...")
+                    
+                    real_filename = f"{event.old.id}{ext}"
+                    if hasattr(event.old.media, 'document') and hasattr(event.old.media.document, 'attributes'):
+                        for attr in event.old.media.document.attributes:
+                            if isinstance(attr, DocumentAttributeFilename):
+                                real_filename = attr.file_name
+                                break
+                    
+                    file_path = os.path.join(output_folder, real_filename)
+                    print(f"[Downloader] Downloading media for ID {event.old.id} as {real_filename}...")
                     await parallel_download(download_client, event.old.media, file_path)
                     downloaded_files = split_file_if_needed(file_path)
-                    
+            
             elif mode == 2 and event.old.media:
+                should_write = True
                 m += 1
                 ext = utils.get_extension(event.old.media)
-                file_path = os.path.join(output_folder, f"{event.old.id}{ext}")
-                print(f"[Downloader] Downloading media for ID {event.old.id} (ext: {ext})...")
+                
+                real_filename = f"{event.old.id}{ext}"
+                if hasattr(event.old.media, 'document') and hasattr(event.old.media.document, 'attributes'):
+                    for attr in event.old.media.document.attributes:
+                        if isinstance(attr, DocumentAttributeFilename):
+                            real_filename = attr.file_name
+                            break
+                            
+                file_path = os.path.join(output_folder, real_filename)
+                print(f"[Downloader] Downloading media for ID {event.old.id} as {real_filename}...")
                 await parallel_download(download_client, event.old.media, file_path)
                 downloaded_files = split_file_if_needed(file_path)
-                
+            
             elif mode == 3 and not event.old.media:
-                dump.write(event_json_str + ",\n")
+                should_write = True
                 c += 1
-            else:
-                # Event doesn't match the selected mode
+            
+            if not should_write:
                 continue
+                
+            # Inject saved target files into the JSON index memory so the resender can pinpoint them exactly
+            event_dict['saved_files'] = [os.path.basename(f) for f in downloaded_files]
+            
+            # Dump to local unified file
+            import json
+            event_json_str = json.dumps(event_dict, default=str)
+            dump.write(event_json_str + ",\n")
 
             # Produce to the queue
             if auto_resend:

@@ -80,7 +80,14 @@ async def main():
             did_send_media_msg = False
 
             if has_media:
-                file_names = glob.glob(f"{input_folder}/{message_id}.*")
+                file_names = msg.get("saved_files", [])
+                
+                # Check for legacy files if new array isn't populated
+                if not file_names:
+                    file_names = glob.glob(f"{input_folder}/{message_id}.*")
+                else:
+                    file_names = [os.path.join(input_folder, fname) for fname in file_names]
+
                 for file_name in file_names:
                     print(f"Sending Media: {file_name}")
                     try:
