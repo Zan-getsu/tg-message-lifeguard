@@ -7,6 +7,9 @@ from datetime import datetime
 import asyncio
 import html
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 input_folder: str = "backup_will_be_inside_me"
 
@@ -20,11 +23,15 @@ async def main():
         content = json.loads(fixed)
         content = sorted(content, key=lambda x: x["date"])
 
-        api_id = "API_ID"
-        api_hash = "API_HASH"
-        chat_id = "GROUP_CHAT_ID"
+        api_id_env = os.getenv("API_ID")
+        api_hash_env = os.getenv("API_HASH")
+        chat_id_env = os.getenv("DESTINATION_GROUP_ID")
+        
+        api_id = int(api_id_env) if api_id_env else int(input("Enter your api_id: "))
+        api_hash = api_hash_env if api_hash_env else input("Enter your api_hash: ")
+        chat_id = int(chat_id_env) if chat_id_env else int(input("Enter your DESTINATION_GROUP_ID: "))
 
-        client = TelegramClient("session_name", api_id, api_hash)
+        client = TelegramClient("tg_session", api_id, api_hash)
         await client.start()
 
         group = await client.get_entity(PeerChannel(int(chat_id)))
