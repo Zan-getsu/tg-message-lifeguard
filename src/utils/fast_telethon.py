@@ -17,9 +17,10 @@ async def _download_worker(client: TelegramClient, location, offset: int, chunk_
     Downloads a specific chunk of a file.
     """
     try:
-        data = await client.download_file(location, offset=offset, limit=chunk_size)
-        file_handle.seek(offset)
-        file_handle.write(data)
+        # iter_download natively supports start offsets and chunk streams
+        async for chunk in client.iter_download(location, offset=offset, request_size=chunk_size, limit=1):
+            file_handle.seek(offset)
+            file_handle.write(chunk)
     except Exception as e:
         print(f"[FastTelethon] Error downloading chunk at offset {offset}: {e}")
         raise e
