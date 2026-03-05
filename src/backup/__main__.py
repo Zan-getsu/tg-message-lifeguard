@@ -522,8 +522,42 @@ async def main() -> None:
         export_mode = int(input("👉 Select export mode (default 1): ") or 1)
     
     # Min/Max ID bounds
-    min_id = args.min_id if args.min_id != 0 else int(input("\n🔢 Enter MIN message ID (0 for all): ") or 0)
-    max_id = args.max_id if args.max_id != 0 else int(input("🔢 Enter MAX message ID (0 for all): ") or 0)
+    min_id = args.min_id
+    max_id = args.max_id
+    
+    # Auto-detect Resume capabilities from previous runs
+    dump_file_path = os.path.join(output_folder, "dump_unified.json")
+    max_saved_id = 0
+    
+    if os.path.exists(dump_file_path) and min_id == 0:
+        try:
+            with open(dump_file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    if line.endswith(","): line = line[:-1]
+                    try:
+                        obj = json.loads(line)
+                        msg_id = obj.get("id")
+                        if msg_id:
+                            max_saved_id = max(max_saved_id, int(msg_id))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+            
+    if max_saved_id > 0 and min_id == 0:
+        print(f"\n🔄 [Smart Resume] Detected previous backup up to Message ID {max_saved_id}")
+        ans = input(f"   Do you want to automatically resume from here? (y/n, default y): ").strip().lower()
+        if ans != 'n':
+            min_id = max_saved_id + 1
+            print(f"   -> Resuming gracefully from Min ID: {min_id}")
+            
+    if min_id == 0:
+        min_id = int(input("\n🔢 Enter MIN message ID (0 for all): ") or 0)
+        
+    if max_id == 0:
+        max_id = int(input("🔢 Enter MAX message ID (0 for all): ") or 0)
     
     # Auto Resend 
     auto_resend = args.auto_resend
