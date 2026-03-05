@@ -71,13 +71,16 @@ BOT_TOKEN=12345:ABCDEFG_your_bot_token_here
 USE_BOT_FOR_DOWNLOAD=false
 
 # --- PERFORMANCE TUNING ---
-WORKERS=8
+WORKERS=10
+DOWNLOAD_WORKERS=8
 ```
 
 ### Performance Tuning
-The `WORKERS` variable controls the number of parallel connections used by `FastTelethon` for downloading and uploading files. Higher values = faster transfers, but going too high may trigger Telegram flood limits.
-- **Default:** `8`
-- **Recommended range:** `4` – `20`
+TML now features **Multi-Sender Connection Pooling** for True Parallel Uploads.
+- `WORKERS`: Controls the number of independent TCP connections to Telegram's Data-Center for uploads. This natively shatters Telegram's single-connection bandwidth cap. 
+  - **Default:** `10`
+  - **Recommended max:** `20` (Higher will trigger FloodWaits)
+- `DOWNLOAD_WORKERS`: Controls chunk concurrency for the fast-downloader. Default is 8.
 
 ### How the Dual-Client System Works
 If you provide a `BOT_TOKEN`, the script creates two separate persistent session files (`tg_session` and `tg_bot_session`).

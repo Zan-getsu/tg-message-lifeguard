@@ -42,6 +42,36 @@ os.makedirs(output_folder, exist_ok=True)
 MAX_FILE_SIZE = int(1.95 * 1024 * 1024 * 1024) 
 
 
+def _build_caption(msg_obj: dict) -> str | None:
+    """
+    Build an HTML-formatted caption string from a message dict.
+    Returns None if there is no meaningful text content.
+    """
+    message_text = msg_obj.get("message", "")
+    has_message = bool(message_text.strip())
+
+    if has_message:
+        message_text = html.escape(message_text)
+
+    # Handle quoted replies
+    reply_to = msg_obj.get("reply_to")
+    has_quote = False
+    quote_text = None
+    if reply_to:
+        has_quote = reply_to.get("quote", False)
+        quote_text = reply_to.get("quote_text", None)
+
+    if has_quote and quote_text:
+        quote_text_escaped = html.escape(quote_text)
+        if has_message:
+            message_text = f"<pre>❝ {quote_text_escaped} ❞</pre>\n\n{message_text}"
+        else:
+            message_text = f"<pre>❝ {quote_text_escaped} ❞</pre>"
+        has_message = True
+
+    return message_text if has_message else None
+
+
 async def split_file_if_needed(filepath: str) -> list[str]:
     """
     Checks if a file exceeds the 1.95GB limit and splits it.
@@ -354,9 +384,9 @@ async def export_messages(
                     if auto_resend and dest_group_id and upload_client and use_stream:
                         print(f"[Streamer] Streaming media for ID {event.old.id} as {real_filename} directly to destination...")
                         dest_entity = await upload_client.get_entity(PeerChannel(dest_group_id))
-                        # To keep formatting consistent, we don't send caption with the file, we just send the file
-                        # and let the existing text logic send the message caption later
-                        await stream_transfer(download_client, event.old, upload_client, dest_entity, caption=None)
+                        # Build caption from original message so it's sent WITH the file
+                        stream_caption = _build_caption(event_dict)
+                        await stream_transfer(download_client, event.old, upload_client, dest_entity, caption=stream_caption)
                         downloaded_files = [f"streamed_part_{i}" for i in range(1, 10)] # Dummy list, not used for streaming
                     else:
                         already_downloaded = False
@@ -393,7 +423,8 @@ async def export_messages(
                 if auto_resend and dest_group_id and upload_client and use_stream:
                     print(f"[Streamer] Streaming media for ID {event.old.id} as {real_filename} directly to destination...")
                     dest_entity = await upload_client.get_entity(PeerChannel(dest_group_id))
-                    await stream_transfer(download_client, event.old, upload_client, dest_entity, caption=None)
+                    stream_caption = _build_caption(event_dict)
+                    await stream_transfer(download_client, event.old, upload_client, dest_entity, caption=stream_caption)
                     downloaded_files = [f"streamed_part_{i}" for i in range(1, 10)] # Dummy list
                 else:
                     already_downloaded = False
@@ -429,10 +460,9 @@ async def export_messages(
             # Produce to the queue for the uploader worker
             if auto_resend:
                 if event.old.media and downloaded_files and downloaded_files[0].startswith("streamed_part_"):
-                    # Media was already streamed directly — only queue the text caption if present
-                    msg_text = event_dict.get("message", "").strip()
-                    if msg_text:
-                        await upload_queue.put((event_json_str, []))
+                    # Media was already streamed directly WITH the caption attached,
+                    # so nothing more to queue — skip duplicate text messages.
+                    pass
                 else:
                     # Queue with file paths for the uploader to handle
                     await upload_queue.put((event_json_str, downloaded_files))

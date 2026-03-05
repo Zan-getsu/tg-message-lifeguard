@@ -4,9 +4,11 @@ import asyncio
 import hashlib
 import random
 import threading
+import logging
 from time import time
 
 from telethon import TelegramClient
+from telethon.network import MTProtoSender
 from telethon.tl.types import (
     Document, Photo,
     MessageMediaDocument, MessageMediaPhoto,
@@ -14,9 +16,19 @@ from telethon.tl.types import (
 )
 from telethon.tl.functions.upload import SaveFilePartRequest, SaveBigFilePartRequest
 
+log = logging.getLogger("FastTelethon")
+
 # Standard FastTelethon constants
 CHUNK_SIZE = 512 * 1024  # 512 KB per chunk
-PARALLEL_WORKERS = int(os.getenv("WORKERS", "8"))  # Configurable via .env (default: 8)
+
+# Number of parallel TCP connections to Telegram's DC for uploads.
+# Each connection is a separate MTProto sender, bypassing single-connection speed caps.
+# Too many => FloodWait errors. Recommended: 8-15. Hard cap: 20.
+UPLOAD_CONNECTIONS = min(int(os.getenv("WORKERS", "10")), 20)
+
+# Parallel download workers (uses standard Telethon iter_download)
+DOWNLOAD_WORKERS = int(os.getenv("DOWNLOAD_WORKERS", "8"))
+
 USER_SAFE_DELAY = True   # Add random small delays to avoid User flood bans (only for downloads now)
 
 # Telegram restricts bot/user uploads to 2GB. We use 1.95GB for safety.
@@ -116,7 +128,51 @@ def _generate_file_id() -> int:
 
 
 # ---------------------------------------------------------------------------
-#  Streaming Transfer (bypass disk entirely for --auto-resend)
+#  Multi-Sender Connection Pool
+#  Creates N independent MTProto TCP connections to Telegram's upload DC.
+#  Each connection is a separate socket — bandwidth is multiplied linearly.
+# ---------------------------------------------------------------------------
+
+async def _create_sender(client: TelegramClient, dc_id: int) -> MTProtoSender:
+    """
+    Open a raw MTProtoSender on a brand-new TCP connection to *dc_id*.
+    Because we are always connecting to the **same DC** as the client, we can
+    reuse the session's existing auth key directly — no auth export/import needed.
+    """
+    dc = await client._get_dc(dc_id)
+    # Reuse the session auth key (same DC — safe and instant, no round-trip)
+    sender = MTProtoSender(client.session.auth_key, loggers=client._log)
+    await sender.connect(
+        client._connection(
+            dc.ip_address,
+            dc.port,
+            dc.id,
+            loggers=client._log,
+            proxy=client._proxy,
+        )
+    )
+    return sender
+
+
+async def _create_upload_pool(
+    client: TelegramClient, count: int
+) -> list[MTProtoSender]:
+    """
+    Spin up *count* senders in parallel — all share the same DC and auth key
+    so every connection completes independently with no sequencing needed.
+    """
+    dc_id = client.session.dc_id
+    senders = await asyncio.gather(
+        *(_create_sender(client, dc_id) for _ in range(count))
+    )
+    return list(senders)
+
+
+async def _cleanup_pool(senders: list[MTProtoSender]) -> None:
+    """Disconnect all senders in the pool gracefully."""
+    await asyncio.gather(*(s.disconnect() for s in senders), return_exceptions=True)
+
+
 # ---------------------------------------------------------------------------
 async def stream_transfer(
     client: TelegramClient,
@@ -166,12 +222,17 @@ async def stream_transfer(
         return None
 
     print(f"[FastTelethon] Starting Memory Stream Transfer of {file_name} ({size / (1024*1024):.2f} MB)...")
+    print(f"[FastTelethon] Using {UPLOAD_CONNECTIONS} parallel upload connections.")
     tracker.init_task(file_name, size, "Streaming")
 
     bytes_transferred_total = 0
     part_number = 1
 
+    # Create the multi-sender pool once upfront for the entire transfer
+    senders: list[MTProtoSender] = []
     try:
+        senders = await _create_upload_pool(dest_client, UPLOAD_CONNECTIONS)
+
         while bytes_transferred_total < size:
             current_file_id = _generate_file_id()
             current_file_name = (
@@ -186,11 +247,21 @@ async def stream_transfer(
 
             print(
                 f"[FastTelethon] Uploading Part {part_number} "
-                f"({bytes_for_this_segment / (1024*1024):.2f} MB) in {part_count} chunks..."
+                f"({bytes_for_this_segment / (1024*1024):.2f} MB) in {part_count} chunks "
+                f"across {len(senders)} connections..."
             )
 
-            upload_tasks = []
             md5_hasher = hashlib.md5() if not is_large else None
+
+            # Semaphore: keep at most N*4 chunk uploads in-flight at once
+            # to avoid queueing too many tasks in memory for huge files
+            sem = asyncio.Semaphore(len(senders) * 4)
+            pending: list[asyncio.Task] = []
+
+            async def _send_chunk(sender: MTProtoSender, req, n_bytes: int) -> None:
+                async with sem:
+                    await sender.send(req)
+                tracker.update_task(file_name, n_bytes)
 
             chunk_index = 0
             async for chunk in client.iter_download(
@@ -199,6 +270,10 @@ async def stream_transfer(
                 request_size=CHUNK_SIZE,
                 limit=part_count,
             ):
+                # iter_download yields memoryview — Telethon's serialize_bytes
+                # only accepts bytes/str, so convert here.
+                if isinstance(chunk, memoryview):
+                    chunk = bytes(chunk)
                 if md5_hasher:
                     md5_hasher.update(chunk)
 
@@ -216,18 +291,15 @@ async def stream_transfer(
                         bytes=chunk,
                     )
 
-                upload_tasks.append(dest_client(req))
-                tracker.update_task(file_name, len(chunk))
-
-                if len(upload_tasks) >= PARALLEL_WORKERS * 2:
-                    await asyncio.gather(*upload_tasks)
-                    upload_tasks.clear()
-
+                # Round-robin across senders — fire and track
+                sender = senders[chunk_index % len(senders)]
+                task = asyncio.create_task(_send_chunk(sender, req, len(chunk)))
+                pending.append(task)
                 chunk_index += 1
 
-            # Drain remaining upload chunks
-            if upload_tasks:
-                await asyncio.gather(*upload_tasks)
+            # Wait for all in-flight uploads for this segment
+            if pending:
+                await asyncio.gather(*pending)
 
             bytes_transferred_total += bytes_for_this_segment
 
@@ -257,12 +329,11 @@ async def stream_transfer(
 
     except Exception as e:
         print(f"[FastTelethon] Stream transfer error for {file_name}: {e}")
-        tracker.complete_task(file_name)
         raise
-
-    tracker.complete_task(file_name)
-    print(f"[FastTelethon] Memory Stream Transfer for {file_name} complete.")
-    return True
+    finally:
+        tracker.complete_task(file_name)
+        if senders:
+            await _cleanup_pool(senders)
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +424,7 @@ async def parallel_download(client: TelegramClient, media_obj, file_path: str):
                 )
                 tasks.append(task)
 
-                if len(tasks) >= PARALLEL_WORKERS:
+                if len(tasks) >= DOWNLOAD_WORKERS:
                     await asyncio.gather(*tasks)
                     tasks.clear()
                     if USER_SAFE_DELAY:
@@ -402,44 +473,52 @@ async def parallel_upload(client: TelegramClient, file_path: str):
             tracker.complete_task(file_name)
             raise
 
-    # --- Large file parallel upload ---
+    # --- Large file multi-connection parallel upload ---
     file_id = _generate_file_id()
     part_count = math.ceil(size / CHUNK_SIZE)
 
-    tasks = []
-
+    print(f"[FastTelethon] Using {UPLOAD_CONNECTIONS} parallel upload connections.")
+    senders: list[MTProtoSender] = []
     try:
-        for i in range(part_count):
-            offset = i * CHUNK_SIZE
+        senders = await _create_upload_pool(client, UPLOAD_CONNECTIONS)
 
-            # Read the chunk from disk
-            with open(file_path, "rb") as f:
-                f.seek(offset)
+        sem = asyncio.Semaphore(len(senders) * 4)
+        pending: list[asyncio.Task] = []
+
+        async def _send_part(sender: MTProtoSender, req, n_bytes: int) -> None:
+            async with sem:
+                await sender.send(req)
+            tracker.update_task(file_name, n_bytes)
+
+        with open(file_path, "rb") as f:
+            for i in range(part_count):
                 chunk_data = f.read(CHUNK_SIZE)
+                if not chunk_data:
+                    break
 
-            req = SaveBigFilePartRequest(
-                file_id=file_id,
-                file_part=i,
-                file_total_parts=part_count,
-                bytes=chunk_data,
-            )
+                req = SaveBigFilePartRequest(
+                    file_id=file_id,
+                    file_part=i,
+                    file_total_parts=part_count,
+                    bytes=chunk_data,
+                )
 
-            tasks.append(client(req))
-            tracker.update_task(file_name, len(chunk_data))
+                sender = senders[i % len(senders)]
+                task = asyncio.create_task(_send_part(sender, req, len(chunk_data)))
+                pending.append(task)
 
-            if len(tasks) >= PARALLEL_WORKERS:
-                await asyncio.gather(*tasks)
-                tasks.clear()
-
-        # Drain remaining
-        if tasks:
-            await asyncio.gather(*tasks)
+        # Wait for all in-flight parts
+        if pending:
+            await asyncio.gather(*pending)
 
     except Exception as e:
         print(f"[FastTelethon] Upload failed for {file_name}: {e}")
-        tracker.complete_task(file_name)
         raise
+    finally:
+        tracker.complete_task(file_name)
+        if senders:
+            await _cleanup_pool(senders)
 
-    tracker.complete_task(file_name)
     print(f"[FastTelethon] Upload complete.")
     return InputFileBig(id=file_id, parts=part_count, name=file_name)
+
