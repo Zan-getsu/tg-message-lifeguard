@@ -454,6 +454,7 @@ async def main() -> None:
     parser.add_argument("--auto-resend", action="store_true", help="Automatically resend downloaded messages to destination")
     parser.add_argument("--stream", action="store_true", help="Use direct memory streaming if auto-resending (no disk saves)")
     parser.add_argument("--disk", action="store_true", help="Use local disk for downloading before re-uploading")
+    parser.add_argument("--auto-resume", action="store_true", help="Automatically set min-id based on previous saved dump logs")
     
     args = parser.parse_args()
 
@@ -547,11 +548,15 @@ async def main() -> None:
             pass
             
     if max_saved_id > 0 and min_id == 0:
-        print(f"\n🔄 [Smart Resume] Detected previous backup up to Message ID {max_saved_id}")
-        ans = input(f"   Do you want to automatically resume from here? (y/n, default y): ").strip().lower()
-        if ans != 'n':
+        if args.auto_resume:
             min_id = max_saved_id + 1
-            print(f"   -> Resuming gracefully from Min ID: {min_id}")
+            print(f"\n🔄 [Smart Resume] Auto-detected previous backup. Resuming seamlessly from Min ID: {min_id}")
+        else:
+            print(f"\n🔄 [Smart Resume] Detected previous backup up to Message ID {max_saved_id}")
+            ans = input(f"   Do you want to automatically resume from here? (y/n, default y): ").strip().lower()
+            if ans != 'n':
+                min_id = max_saved_id + 1
+                print(f"   -> Resuming gracefully from Min ID: {min_id}")
             
     if min_id == 0:
         min_id = int(input("\n🔢 Enter MIN message ID (0 for all): ") or 0)
@@ -603,5 +608,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n\n[System] Shutdown signal received. Exiting gracefully...")
