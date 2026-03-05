@@ -16,7 +16,7 @@ from telethon.tl.functions.upload import SaveFilePartRequest, SaveBigFilePartReq
 
 # Standard FastTelethon constants
 CHUNK_SIZE = 512 * 1024  # 512 KB per chunk
-PARALLEL_WORKERS = 8     # Bumped from 4 to 8 for WZML-X speed parity
+PARALLEL_WORKERS = int(os.getenv("WORKERS", "8"))  # Configurable via .env (default: 8)
 USER_SAFE_DELAY = True   # Add random small delays to avoid User flood bans (only for downloads now)
 
 # Telegram restricts bot/user uploads to 2GB. We use 1.95GB for safety.

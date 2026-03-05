@@ -69,7 +69,15 @@ DESTINATION_GROUP_ID=-100YOUR_DESTINATION_GROUP
 # --- ADVANCED DUAL CLIENT SYSTEM ---
 BOT_TOKEN=12345:ABCDEFG_your_bot_token_here
 USE_BOT_FOR_DOWNLOAD=false
+
+# --- PERFORMANCE TUNING ---
+WORKERS=8
 ```
+
+### Performance Tuning
+The `WORKERS` variable controls the number of parallel connections used by `FastTelethon` for downloading and uploading files. Higher values = faster transfers, but going too high may trigger Telegram flood limits.
+- **Default:** `8`
+- **Recommended range:** `4` – `20`
 
 ### How the Dual-Client System Works
 If you provide a `BOT_TOKEN`, the script creates two separate persistent session files (`tg_session` and `tg_bot_session`).
