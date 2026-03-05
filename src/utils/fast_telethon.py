@@ -380,10 +380,17 @@ async def parallel_download(client: TelegramClient, media_obj, file_path: str):
         )
 
     if isinstance(document, Document) or isinstance(document, Photo):
-        # We can extract true info via client
-        info = await client._get_file_info(media_obj)
-        dc_id, location = info.dc_id, info.location
-        size = info.size
+        # Extract true info safely without internal methods
+        from telethon import utils
+        dc_id, location = utils.get_input_location(media_obj)
+        if isinstance(document, Document):
+            size = document.size
+        else:
+            largest_size = max(
+                document.sizes,
+                key=lambda s: getattr(s, 'size', 0) if hasattr(s, 'size') else 0,
+            )
+            size = getattr(largest_size, 'size', 0)
     else:
         return await client.download_media(media_obj, file_path)
 
