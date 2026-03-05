@@ -104,9 +104,11 @@ python -m src.backup
 
 ### Automated CLI Mode
 ```bash
-python -m src.backup --mode 1 --min-id 0 --max-id 0 --auto-resend --stream --auto-resume
+python -m src.backup --mode 1 --min-id 0 --max-id 0 --min-size 200MB --max-size 500MB --auto-resend --stream --auto-resume
 ```
 * **`--mode`**: `1` (Export All), `2` (Only Media), `3` (Only Text)
+* **`--min-size`**: Minimum file size filter (e.g., `200MB`, `1GB`). Only media files meeting this size will be processed.
+* **`--max-size`**: Maximum file size filter (e.g., `500MB`, `2GB`). Files larger than this will be skipped.
 * **`--auto-resend`**: Triggers the upload pipeline to your `DESTINATION_GROUP_ID`.
 * **`--stream`**: Forces Direct Memory Streaming (skips saving to local disk).
 * **`--disk`**: Forces Local Disk Backup (caches files to hard drive first).

@@ -62,6 +62,10 @@ class GlobalTracker:
             if file_name in self.active_tasks:
                 del self.active_tasks[file_name]
 
+    def has_active_tasks(self) -> bool:
+        with self.lock:
+            return bool(self.active_tasks)
+
     def _get_readable_file_size(self, size_in_bytes) -> str:
         if size_in_bytes is None or size_in_bytes == 0:
             return '0B'
@@ -416,19 +420,21 @@ async def parallel_download(client: TelegramClient, media_obj, file_path: str):
         
         async def _download_chunk(sender: MTProtoSender, offset: int, limit: int, file_handle):
             req = GetFileRequest(location=location, offset=offset, limit=limit)
-            for attempt in range(4):
-                try:
-                    result = await sender.send(req)
-                    chunk_data = result.bytes
-                    
-                    file_handle.seek(offset)
-                    file_handle.write(chunk_data)
-                    tracker.update_task(base_name, len(chunk_data))
-                    break
-                except Exception as e:
-                    if attempt == 3: raise
-                    await asyncio.sleep(1 + attempt)
-            sem.release()
+            try:
+                for attempt in range(4):
+                    try:
+                        result = await sender.send(req)
+                        chunk_data = result.bytes
+
+                        file_handle.seek(offset)
+                        file_handle.write(chunk_data)
+                        tracker.update_task(base_name, len(chunk_data))
+                        break
+                    except Exception as e:
+                        if attempt == 3: raise
+                        await asyncio.sleep(1 + attempt)
+            finally:
+                sem.release()
             
         with open(file_path, "wb") as f:
             f.seek(size - 1)

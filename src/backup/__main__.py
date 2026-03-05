@@ -39,7 +39,40 @@ os.makedirs(output_folder, exist_ok=True)
 # Telegram clients will be initialized in main()
 
 # Telegram restricts bot/user uploads to 2GB. We use 1.95GB for safety.
-MAX_FILE_SIZE = int(1.95 * 1024 * 1024 * 1024) 
+MAX_FILE_SIZE = int(1.95 * 1024 * 1024 * 1024)
+
+
+def _parse_size(size_str: str) -> int:
+    """
+    Parse a human-readable size string (e.g., '100MB', '1GB', '500KB') into bytes.
+    Returns the size in bytes as an integer.
+    """
+    if not size_str:
+        return 0
+
+    size_str = size_str.strip().upper()
+
+    multipliers = {
+        'B': 1,
+        'KB': 1024,
+        'MB': 1024 ** 2,
+        'GB': 1024 ** 3,
+        'TB': 1024 ** 4,
+    }
+
+    for suffix, multiplier in sorted(multipliers.items(), key=lambda x: -len(x[0])):
+        if size_str.endswith(suffix):
+            try:
+                number = float(size_str[:-len(suffix)].strip())
+                return int(number * multiplier)
+            except ValueError:
+                raise ValueError(f"Invalid size format: {size_str}")
+
+    # If no suffix, assume bytes
+    try:
+        return int(size_str)
+    except ValueError:
+        raise ValueError(f"Invalid size format: {size_str}") 
 
 
 def _build_caption(msg_obj: dict) -> str | None:
@@ -270,6 +303,8 @@ async def export_messages(
     use_stream: bool,
     min_id: int = 0,
     max_id: int = 0,
+    min_size: int = 0,
+    max_size: int = 0,
 ) -> None:
     """
     Exports messages and orchestrates the parallel backup and resend queues.
@@ -365,24 +400,33 @@ async def export_messages(
             if event.old.id in processed_message_ids:
                 if auto_resend:
                     continue # Skip everything if it's already uploaded
-                
+
             # --- Text/Media Filtering ---
             if mode == 1: # Export All (Text + Media)
                 should_write = True
                 if event.old.media:
                     m += 1
                     ext = utils.get_extension(event.old.media)
-                    
+
                     real_filename = f"{event.old.id}{ext}"
                     if hasattr(event.old.media, 'document') and hasattr(event.old.media.document, 'attributes'):
                         for attr in event.old.media.document.attributes:
                             if isinstance(attr, DocumentAttributeFilename):
                                 real_filename = attr.file_name
                                 break
-                    
+
                     file_path = os.path.join(output_folder, real_filename)
 
                     file_size = getattr(event.old.media.document, 'size', 0) if hasattr(event.old.media, 'document') and event.old.media.document else 0
+
+                    # --- File Size Range Filter ---
+                    if min_size > 0 and file_size < min_size:
+                        print(f"[Filter] Skipping {real_filename} ({file_size / (1024*1024):.2f} MB) - below minimum size ({min_size / (1024*1024):.2f} MB)")
+                        continue
+                    if max_size > 0 and file_size > max_size:
+                        print(f"[Filter] Skipping {real_filename} ({file_size / (1024*1024):.2f} MB) - exceeds maximum size ({max_size / (1024*1024):.2f} MB)")
+                        continue
+
                     is_eligible_for_stream = use_stream and (file_size <= MAX_FILE_SIZE)
                     if use_stream and file_size > MAX_FILE_SIZE:
                         print(f"[Streamer] File {real_filename} is > 2GB ({(file_size/(1024**3)):.2f}GB). Falling back to disk storing and splitting.")
@@ -417,17 +461,26 @@ async def export_messages(
                 should_write = True
                 m += 1
                 ext = utils.get_extension(event.old.media)
-                
+
                 real_filename = f"{event.old.id}{ext}"
                 if hasattr(event.old.media, 'document') and hasattr(event.old.media.document, 'attributes'):
                     for attr in event.old.media.document.attributes:
                         if isinstance(attr, DocumentAttributeFilename):
                             real_filename = attr.file_name
                             break
-                            
+
                 file_path = os.path.join(output_folder, real_filename)
 
                 file_size = getattr(event.old.media.document, 'size', 0) if hasattr(event.old.media, 'document') and event.old.media.document else 0
+
+                # --- File Size Range Filter ---
+                if min_size > 0 and file_size < min_size:
+                    print(f"[Filter] Skipping {real_filename} ({file_size / (1024*1024):.2f} MB) - below minimum size ({min_size / (1024*1024):.2f} MB)")
+                    continue
+                if max_size > 0 and file_size > max_size:
+                    print(f"[Filter] Skipping {real_filename} ({file_size / (1024*1024):.2f} MB) - exceeds maximum size ({max_size / (1024*1024):.2f} MB)")
+                    continue
+
                 is_eligible_for_stream = use_stream and (file_size <= MAX_FILE_SIZE)
                 if use_stream and file_size > MAX_FILE_SIZE:
                     print(f"[Streamer] File {real_filename} is > 2GB ({(file_size/(1024**3)):.2f}GB). Falling back to disk storing and splitting.")
@@ -497,6 +550,8 @@ async def main() -> None:
     parser.add_argument("--mode", type=int, choices=[1, 2, 3], help="Export mode (1: All, 2: Media, 3: Text)")
     parser.add_argument("--min-id", type=int, default=0, help="Minimum message ID to export")
     parser.add_argument("--max-id", type=int, default=0, help="Maximum message ID to export")
+    parser.add_argument("--min-size", type=str, default=None, help="Minimum file size (e.g., '100MB', '1GB'). Only for media exports.")
+    parser.add_argument("--max-size", type=str, default=None, help="Maximum file size (e.g., '500MB', '2GB'). Only for media exports.")
     parser.add_argument("--auto-resend", action="store_true", help="Automatically resend downloaded messages to destination")
     parser.add_argument("--stream", action="store_true", help="Use direct memory streaming if auto-resending (no disk saves)")
     parser.add_argument("--disk", action="store_true", help="Use local disk for downloading before re-uploading")
@@ -522,8 +577,8 @@ async def main() -> None:
             
             # Start an auto-refresh loop in the background
             async def auto_refresh(target_msg):
-                tracker_was_active = bool(tracker.active_tasks)
-                while tracker.active_tasks:
+                tracker_was_active = tracker.has_active_tasks()
+                while tracker.has_active_tasks():
                     await asyncio.sleep(5)
                     try:
                         new_text = tracker.get_status_string()
@@ -534,14 +589,14 @@ async def main() -> None:
                         if "Message is not modified" not in str(e):
                             print(f"[Status Refresh Error] {e}")
                             break
-                            
+
                 # When loop finishes, do one final update to show empty state
                 if tracker_was_active:
                     try:
                         await target_msg.edit("All transfers completed! ✅")
                     except:
                         pass
-                        
+
             asyncio.create_task(auto_refresh(msg))
             
     if not bot_token or not use_bot_for_download:
@@ -606,9 +661,27 @@ async def main() -> None:
             
     if min_id == 0:
         min_id = int(input("\n🔢 Enter MIN message ID (0 for all): ") or 0)
-        
+
     if max_id == 0:
         max_id = int(input("🔢 Enter MAX message ID (0 for all): ") or 0)
+
+    # File Size Range Filter
+    min_size_bytes = 0
+    max_size_bytes = 0
+
+    if args.min_size:
+        try:
+            min_size_bytes = _parse_size(args.min_size)
+            print(f"\n📏 Minimum file size filter: {args.min_size} ({min_size_bytes / (1024*1024):.2f} MB)")
+        except ValueError as e:
+            print(f"\n⚠️ Warning: Invalid --min-size format: {e}")
+
+    if args.max_size:
+        try:
+            max_size_bytes = _parse_size(args.max_size)
+            print(f"📏 Maximum file size filter: {args.max_size} ({max_size_bytes / (1024*1024):.2f} MB)")
+        except ValueError as e:
+            print(f"\n⚠️ Warning: Invalid --max-size format: {e}")
     
     # Auto Resend 
     auto_resend = args.auto_resend
@@ -649,7 +722,9 @@ async def main() -> None:
         auto_resend=auto_resend,
         use_stream=use_stream,
         min_id=min_id,
-        max_id=max_id
+        max_id=max_id,
+        min_size=min_size_bytes,
+        max_size=max_size_bytes,
     )
 
 

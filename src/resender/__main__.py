@@ -64,8 +64,9 @@ async def main():
                 f"{message_id} {message}, {date}, has_media: {has_media}, from_id: {from_id}, reply_to: {reply_to}"
             )
 
-            if msg["reply_to"]["quote"]:
-                quote_text = msg["reply_to"].get("quote_text", None)
+            reply_to = msg.get("reply_to")
+            if reply_to and reply_to.get("quote"):
+                quote_text = reply_to.get("quote_text", None)
                 if quote_text is not None:
                     quote_text = html.escape(quote_text)
                     if has_message:
@@ -81,12 +82,13 @@ async def main():
 
             if has_media:
                 file_names = msg.get("saved_files", [])
-                
+
                 # Check for legacy files if new array isn't populated
                 if not file_names:
                     file_names = glob.glob(f"{input_folder}/{message_id}.*")
                 else:
-                    file_names = [os.path.join(input_folder, fname) for fname in file_names]
+                    # Ensure we only use basename to avoid path corruption
+                    file_names = [os.path.join(input_folder, os.path.basename(fname)) for fname in file_names]
 
                 for file_name in file_names:
                     print(f"Sending Media: {file_name}")
