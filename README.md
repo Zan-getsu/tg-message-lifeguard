@@ -93,12 +93,13 @@ python -m src.backup
 
 ### Automated CLI Mode
 ```bash
-python -m src.backup --mode 1 --min-id 0 --max-id 0 --auto-resend --stream
+python -m src.backup --mode 1 --min-id 0 --max-id 0 --auto-resend --stream --auto-resume
 ```
 * **`--mode`**: `1` (Export All), `2` (Only Media), `3` (Only Text)
 * **`--auto-resend`**: Triggers the upload pipeline to your `DESTINATION_GROUP_ID`.
 * **`--stream`**: Forces Direct Memory Streaming (skips saving to local disk).
 * **`--disk`**: Forces Local Disk Backup (caches files to hard drive first).
+* **`--auto-resume`**: Automatically sets `min-id` by detecting the last saved message in your `dump.json` file, bypassing interactive prompts.
 
 *(Note: On your very first run, TML will ask for your Telegram phone number and 2FA code to generate your local `tg_session.session` file. You will not have to login again.)*
 
