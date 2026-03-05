@@ -475,17 +475,26 @@ async def main() -> None:
             
             # Start an auto-refresh loop in the background
             async def auto_refresh(target_msg):
+                tracker_was_active = bool(tracker.active_tasks)
                 while tracker.active_tasks:
                     await asyncio.sleep(5)
                     try:
                         new_text = tracker.get_status_string()
                         if new_text != target_msg.text:
                             await target_msg.edit(new_text)
+                            target_msg.text = new_text
                     except Exception as e:
                         if "Message is not modified" not in str(e):
                             print(f"[Status Refresh Error] {e}")
                             break
                             
+                # When loop finishes, do one final update to show empty state
+                if tracker_was_active:
+                    try:
+                        await target_msg.edit("All transfers completed! ✅")
+                    except:
+                        pass
+                        
             asyncio.create_task(auto_refresh(msg))
             
     if not bot_token or not use_bot_for_download:
