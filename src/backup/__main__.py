@@ -16,7 +16,7 @@ from telethon.tl.types import PeerChannel, DocumentAttributeFilename
 from telethon.errors import RPCError
 from telethon import utils
 
-from src.utils.fast_telethon import parallel_download, parallel_upload
+from src.utils.fast_telethon import parallel_download, parallel_upload, stream_transfer, tracker
 
 load_dotenv()
 
@@ -42,9 +42,10 @@ os.makedirs(output_folder, exist_ok=True)
 MAX_FILE_SIZE = int(1.95 * 1024 * 1024 * 1024) 
 
 
-def split_file_if_needed(filepath: str) -> list[str]:
+async def split_file_if_needed(filepath: str) -> list[str]:
     """
-    Checks if a file exceeds the 1.95GB limit and splits it into byte chunks if needed.
+    Checks if a file exceeds the 1.95GB limit and splits it.
+    Uses an asynchronous chunked read buffer to prevent massive RAM freezes.
     Returns a list of file paths (either the original file, or the newly split parts).
     """
     if not os.path.exists(filepath):
@@ -54,28 +55,52 @@ def split_file_if_needed(filepath: str) -> list[str]:
     if file_size <= MAX_FILE_SIZE:
         return [filepath]
     
+    base_name = os.path.basename(filepath)
+    tracker.init_task(base_name, file_size, "Splitting")
     print(f"\n[Splitter] File {filepath} is {(file_size / (1024**3)):.2f}GB. Splitting into {MAX_FILE_SIZE / (1024**3):.2f}GB parts...")
     
     part_files = []
     part_num = 1
     
+    # 16MB read chunks to keep RAM usage microscopic while splitting
+    read_chunk_size = 1024 * 1024 * 16 
+    
     with open(filepath, 'rb') as f_in:
         while True:
-            chunk = f_in.read(MAX_FILE_SIZE)
-            if not chunk:
-                break
-            
             part_filename = f"{filepath}.part{part_num}"
+            bytes_written_to_part = 0
+            
             with open(part_filename, 'wb') as f_out:
-                f_out.write(chunk)
+                while bytes_written_to_part < MAX_FILE_SIZE:
+                    # Read only enough bytes to finish the part or a standard chunk
+                    bytes_to_read = min(read_chunk_size, MAX_FILE_SIZE - bytes_written_to_part)
+                    chunk = f_in.read(bytes_to_read)
+                    
+                    if not chunk:
+                        break # EOF Reached
+                        
+                    f_out.write(chunk)
+                    bytes_written_to_part += len(chunk)
+                    tracker.update_task(base_name, len(chunk))
+                    
+                    # Yield to the asyncio event loop so we don't block Telegram downloads
+                    await asyncio.sleep(0) 
+
+            # Check if we actually wrote anything to this part
+            if bytes_written_to_part == 0:
+                os.remove(part_filename)
+                break
                 
             part_files.append(part_filename)
             print(f"[Splitter] Created chunk: {part_filename}")
             part_num += 1
             
-    # We can either delete the original huge file to save space, or keep it.
-    # To save space for the user, we will remove the huge original file since it's now split.
+            if bytes_written_to_part < MAX_FILE_SIZE:
+                 break # EOF Reached naturally during this part
+            
+    # Remove the huge original file since it's now cleanly split.
     os.remove(filepath)
+    tracker.complete_task(base_name)
     print(f"[Splitter] Deleted original oversized file to preserve disk space.")
     
     return part_files
@@ -94,6 +119,9 @@ async def uploader_worker(upload_client: TelegramClient, queue: asyncio.Queue, d
         return
 
     dest_entity = await upload_client.get_entity(PeerChannel(dest_group_id))
+
+    # To track what we've already uploaded so we don't duplicate on restarts
+    dump_file = os.path.join(output_folder, "dump_unified.json")
 
     while True:
         item = await queue.get()
@@ -181,6 +209,17 @@ async def uploader_worker(upload_client: TelegramClient, queue: asyncio.Queue, d
                 except Exception as e:
                     print(f"[Uploader Error] Failed sending text: {e}")
                     
+            
+            # --- Resume Memorization ---
+            # If everything succeeded, update the dump file to mark it as uploaded
+            if msg_obj:
+                msg_obj["is_uploaded"] = True
+                updated_json_str = json.dumps(msg_obj, default=str)
+                # It's safest to append the updated status to the end of the file. 
+                # The script reading it will just use the latest entry for a given ID.
+                with open(dump_file, "a", encoding="utf-8") as dump:
+                    dump.write(updated_json_str + ",\n")
+                    
         except Exception as e:
             print(f"[Uploader Error] Unhandled exception processing queue item: {e}")
             
@@ -203,6 +242,25 @@ async def export_messages(
     group: PeerChannel = await download_client.get_entity(PeerChannel(source_group_id))
     dump_file = os.path.join(output_folder, "dump_unified.json")
     
+    # --- Parse Resume State ---
+    processed_message_ids = set()
+    if os.path.exists(dump_file):
+        print("\n[Resume] Analyzing local dump file to find already processed messages...")
+        with open(dump_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                if line.endswith(","): line = line[:-1] # Remove trailing comma
+                try:
+                    obj = json.loads(line)
+                    if obj.get("is_uploaded", False) or mode == 3:
+                        # For text-only backups, mere presence in the dump means it's processed
+                        processed_message_ids.add(obj.get("id"))
+                except Exception:
+                    # Ignore malformed JSON lines caused by abrupt script termination
+                    pass
+        print(f"[Resume] Found {len(processed_message_ids)} already processed/uploaded messages. These will be skipped.")
+    
     file_mode: str = "a" if os.path.exists(dump_file) else "w"
     
     print("\n[Phase 1] Fetching all deleted events from Telegram...")
@@ -212,7 +270,7 @@ async def export_messages(
     try:
         current_max_id = max_id or 0
         while True:
-            events = [
+            fetched_events = [
                 event
                 async for event in download_client.iter_admin_log(
                     group,
@@ -223,15 +281,15 @@ async def export_messages(
                 )
             ]
 
-            if not events:
+            if not fetched_events:
                 break
                 
-            valid_events = [e for e in events if e.deleted_message and e.old.id >= min_id]
+            valid_events = [e for e in fetched_events if e.deleted_message and e.old.id >= min_id]
             all_events.extend(valid_events)
             
             print(f"Fetched {len(valid_events)} events in this batch...")
 
-            current_max_id = events[-1].id - 1
+            current_max_id = fetched_events[-1].id - 1
             if current_max_id < min_id:
                 break
                 
@@ -268,6 +326,11 @@ async def export_messages(
             downloaded_files = []
             should_write = False
             
+            # --- Resume Skip Logic ---
+            if event.old.id in processed_message_ids:
+                if auto_resend:
+                    continue # Skip everything if it's already uploaded
+                
             # --- Text/Media Filtering ---
             if mode == 1: # Export All (Text + Media)
                 should_write = True
@@ -283,9 +346,31 @@ async def export_messages(
                                 break
                     
                     file_path = os.path.join(output_folder, real_filename)
-                    print(f"[Downloader] Downloading media for ID {event.old.id} as {real_filename}...")
-                    await parallel_download(download_client, event.old.media, file_path)
-                    downloaded_files = split_file_if_needed(file_path)
+                    if auto_resend and dest_group_id and upload_client:
+                        print(f"[Streamer] Streaming media for ID {event.old.id} as {real_filename} directly to destination...")
+                        dest_entity = await upload_client.get_entity(PeerChannel(dest_group_id))
+                        # To keep formatting consistent, we don't send caption with the file, we just send the file
+                        # and let the existing text logic send the message caption later
+                        await stream_transfer(download_client, event.old, upload_client, dest_entity, caption=None)
+                        downloaded_files = [f"streamed_part_{i}" for i in range(1, 10)] # Dummy list, not used for streaming
+                    else:
+                        already_downloaded = False
+                        
+                        # Smart Resume Check for Downloads
+                        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                             print(f"[Resume] File {real_filename} already exists locally. Skipping download.")
+                             already_downloaded = True
+                        elif os.path.exists(f"{file_path}.part1"):
+                             print(f"[Resume] Split parts for {real_filename} already exist locally. Skipping download.")
+                             already_downloaded = True
+                             
+                        if not already_downloaded:
+                             print(f"[Downloader] Downloading media for ID {event.old.id} as {real_filename}...")
+                             await parallel_download(download_client, event.old, file_path)
+                             
+                        # Always check if we need to split it or return its parts for the queue
+                        # If already downloaded but not split yet (meaning script died purely mid-split), this safely handles it.
+                        downloaded_files = await split_file_if_needed(file_path)
             
             elif mode == 2 and event.old.media:
                 should_write = True
@@ -300,9 +385,27 @@ async def export_messages(
                             break
                             
                 file_path = os.path.join(output_folder, real_filename)
-                print(f"[Downloader] Downloading media for ID {event.old.id} as {real_filename}...")
-                await parallel_download(download_client, event.old.media, file_path)
-                downloaded_files = split_file_if_needed(file_path)
+                if auto_resend and dest_group_id and upload_client:
+                    print(f"[Streamer] Streaming media for ID {event.old.id} as {real_filename} directly to destination...")
+                    dest_entity = await upload_client.get_entity(PeerChannel(dest_group_id))
+                    await stream_transfer(download_client, event.old, upload_client, dest_entity, caption=None)
+                    downloaded_files = [f"streamed_part_{i}" for i in range(1, 10)] # Dummy list
+                else:
+                    already_downloaded = False
+                    
+                    # Smart Resume Check for Downloads
+                    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                         print(f"[Resume] File {real_filename} already exists locally. Skipping download.")
+                         already_downloaded = True
+                    elif os.path.exists(f"{file_path}.part1"):
+                         print(f"[Resume] Split parts for {real_filename} already exist locally. Skipping download.")
+                         already_downloaded = True
+                         
+                    if not already_downloaded:
+                         print(f"[Downloader] Downloading media for ID {event.old.id} as {real_filename}...")
+                         await parallel_download(download_client, event.old, file_path)
+                         
+                    downloaded_files = await split_file_if_needed(file_path)
             
             elif mode == 3 and not event.old.media:
                 should_write = True
@@ -315,13 +418,19 @@ async def export_messages(
             event_dict['saved_files'] = [os.path.basename(f) for f in downloaded_files]
             
             # Dump to local unified file
-            import json
             event_json_str = json.dumps(event_dict, default=str)
             dump.write(event_json_str + ",\n")
 
-            # Produce to the queue
+            # Produce to the queue for the uploader worker
             if auto_resend:
-                await upload_queue.put((event_json_str, downloaded_files))
+                if event.old.media and downloaded_files and downloaded_files[0].startswith("streamed_part_"):
+                    # Media was already streamed directly — only queue the text caption if present
+                    msg_text = event_dict.get("message", "").strip()
+                    if msg_text:
+                        await upload_queue.put((event_json_str, []))
+                else:
+                    # Queue with file paths for the uploader to handle
+                    await upload_queue.put((event_json_str, downloaded_files))
                 
         print("\n[Downloader] Finished downloading all targeted messages.")
         
@@ -354,7 +463,14 @@ async def main() -> None:
     if bot_token:
         bot_client = TelegramClient("tg_bot_session", api_id, api_hash)
         await bot_client.start(bot_token=bot_token)
-    
+        
+        # Register the /status command listener
+        @bot_client.on(events.NewMessage(pattern=r'^/status$'))
+        async def status_handler(event):
+            # Reply with the formatted tracker string
+            status_text = tracker.get_status_string()
+            await event.reply(status_text)
+            
     if not bot_token or not use_bot_for_download:
         user_client = TelegramClient("tg_session", api_id, api_hash)
         await user_client.start()
