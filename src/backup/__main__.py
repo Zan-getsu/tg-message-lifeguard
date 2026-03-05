@@ -162,6 +162,9 @@ async def uploader_worker(upload_client: TelegramClient, queue: asyncio.Queue, d
             message_text = msg_obj.get("message", "")
             has_message = bool(message_text.strip())
             
+            if has_message:
+                message_text = html.escape(message_text)
+            
             if has_quote and quote_text:
                 quote_text_escaped = html.escape(quote_text)
                 if has_message:
@@ -198,6 +201,7 @@ async def uploader_worker(upload_client: TelegramClient, queue: asyncio.Queue, d
                         print(f"[Uploader Error] Failed sending {file_path}: {e}")
             
             if has_message and not did_send_media_msg:
+                print(f"[Uploader] Forwarding pure text message ID {message_id}...")
                 try:
                     await upload_client.send_message(
                         entity=dest_entity,
@@ -207,7 +211,7 @@ async def uploader_worker(upload_client: TelegramClient, queue: asyncio.Queue, d
                     )
                     await asyncio.sleep(2)
                 except Exception as e:
-                    print(f"[Uploader Error] Failed sending text: {e}")
+                    print(f"[Uploader Error] Failed sending text for ID {message_id}: {e}")
                     
             
             # --- Resume Memorization ---
