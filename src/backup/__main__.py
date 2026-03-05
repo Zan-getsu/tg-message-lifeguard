@@ -233,6 +233,7 @@ async def export_messages(
     dest_group_id: int,
     mode: int,
     auto_resend: bool,
+    use_stream: bool,
     min_id: int = 0,
     max_id: int = 0,
 ) -> None:
@@ -346,7 +347,7 @@ async def export_messages(
                                 break
                     
                     file_path = os.path.join(output_folder, real_filename)
-                    if auto_resend and dest_group_id and upload_client:
+                    if auto_resend and dest_group_id and upload_client and use_stream:
                         print(f"[Streamer] Streaming media for ID {event.old.id} as {real_filename} directly to destination...")
                         dest_entity = await upload_client.get_entity(PeerChannel(dest_group_id))
                         # To keep formatting consistent, we don't send caption with the file, we just send the file
@@ -385,7 +386,7 @@ async def export_messages(
                             break
                             
                 file_path = os.path.join(output_folder, real_filename)
-                if auto_resend and dest_group_id and upload_client:
+                if auto_resend and dest_group_id and upload_client and use_stream:
                     print(f"[Streamer] Streaming media for ID {event.old.id} as {real_filename} directly to destination...")
                     dest_entity = await upload_client.get_entity(PeerChannel(dest_group_id))
                     await stream_transfer(download_client, event.old, upload_client, dest_entity, caption=None)
@@ -451,6 +452,8 @@ async def main() -> None:
     parser.add_argument("--min-id", type=int, default=0, help="Minimum message ID to export")
     parser.add_argument("--max-id", type=int, default=0, help="Maximum message ID to export")
     parser.add_argument("--auto-resend", action="store_true", help="Automatically resend downloaded messages to destination")
+    parser.add_argument("--stream", action="store_true", help="Use direct memory streaming if auto-resending (no disk saves)")
+    parser.add_argument("--disk", action="store_true", help="Use local disk for downloading before re-uploading")
     
     args = parser.parse_args()
 
@@ -467,9 +470,23 @@ async def main() -> None:
         # Register the /status command listener
         @bot_client.on(events.NewMessage(pattern=r'^/status$'))
         async def status_handler(event):
-            # Reply with the formatted tracker string
             status_text = tracker.get_status_string()
-            await event.reply(status_text)
+            msg = await event.reply(status_text)
+            
+            # Start an auto-refresh loop in the background
+            async def auto_refresh(target_msg):
+                while tracker.active_tasks:
+                    await asyncio.sleep(5)
+                    try:
+                        new_text = tracker.get_status_string()
+                        if new_text != target_msg.text:
+                            await target_msg.edit(new_text)
+                    except Exception as e:
+                        if "Message is not modified" not in str(e):
+                            print(f"[Status Refresh Error] {e}")
+                            break
+                            
+            asyncio.create_task(auto_refresh(msg))
             
     if not bot_token or not use_bot_for_download:
         user_client = TelegramClient("tg_session", api_id, api_hash)
@@ -478,36 +495,57 @@ async def main() -> None:
     download_client = bot_client if (bot_token and use_bot_for_download) else user_client
     upload_client = bot_client if bot_token else user_client
     
-    print("\n--- Unified Telegram Sync ---")
+    print("\n" + "="*50)
+    print("      🌊 TG MESSAGE LIFEGUARD - UNIFIED SYNC 🌊")
+    print("="*50)
     
-    src_id_input = source_group_env if source_group_env else input("Enter SOURCE Group/Channel ID: ")
+    src_id_input = source_group_env if source_group_env else input("\n📡 Enter SOURCE Group/Channel ID: ")
     src_id = int(src_id_input)
     
     # Mode
     if args.mode is not None:
         export_mode = args.mode
     else:
-        print("\n1 - Export All (Text + Media)")
-        print("2 - Export Media Only")
-        print("3 - Export Text Only")
-        export_mode = int(input("Enter export mode: ") or 1)
+        print("\n📥 Export Modes:")
+        print("   1 - Export All (Text + Media)")
+        print("   2 - Export Media Only")
+        print("   3 - Export Text Only")
+        export_mode = int(input("👉 Select export mode (default 1): ") or 1)
     
     # Min/Max ID bounds
-    min_id = args.min_id if args.min_id != 0 else int(input("\nEnter min message ID (0 for all): ") or 0)
-    max_id = args.max_id if args.max_id != 0 else int(input("Enter max message ID (0 for all): ") or 0)
+    min_id = args.min_id if args.min_id != 0 else int(input("\n🔢 Enter MIN message ID (0 for all): ") or 0)
+    max_id = args.max_id if args.max_id != 0 else int(input("🔢 Enter MAX message ID (0 for all): ") or 0)
     
     # Auto Resend 
     auto_resend = args.auto_resend
     if not auto_resend:
-        # If not passed via CLI, optionally ask the user interactively hook
-        auto_resend_ans = input("\nDo you want to automatically resend downloaded messages to a destination group? (y/n): ").strip().lower()
+        # If not passed via CLI, optionally ask the user interactively
+        auto_resend_ans = input("\n🚀 Do you want to automatically RESEND downloaded messages to a destination group? (y/n): ").strip().lower()
         auto_resend = auto_resend_ans == 'y'
         
     dest_id = None
+    use_stream = False
+    
     if auto_resend:
-        dest_id_input = dest_group_env if dest_group_env else input("Enter DESTINATION Group/Channel ID: ")
+        dest_id_input = dest_group_env if dest_group_env else input("\n🎯 Enter DESTINATION Group/Channel ID: ")
         dest_id = int(dest_id_input)
         
+        # Decide Streaming vs Disk Mode
+        if args.stream:
+            use_stream = True
+        elif args.disk:
+            use_stream = False
+        else:
+            print("\n⚡ Upload Engine Optimization ⚡")
+            print("   S - Direct Memory Stream (Ultra-fast, skips saving to Local Hard Drive)")
+            print("   D - Local Disk Backup (Downloads to hard drive first, then uploads)")
+            choice = input("👉 Choose engine (S/D, default S): ").strip().lower()
+            use_stream = (choice != 'd') # Defaults to streaming unless they explicitly say 'd'
+
+    print("\n" + "="*50)
+    print("🚀 INITIALIZING SYNC ENGINE...")
+    print("="*50 + "\n")
+
     await export_messages(
         download_client=download_client,
         upload_client=upload_client,
@@ -515,6 +553,7 @@ async def main() -> None:
         dest_group_id=dest_id,
         mode=export_mode,
         auto_resend=auto_resend,
+        use_stream=use_stream,
         min_id=min_id,
         max_id=max_id
     )
