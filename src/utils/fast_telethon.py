@@ -341,9 +341,12 @@ async def stream_transfer(
 # ---------------------------------------------------------------------------
 async def _create_download_pool(client: TelegramClient, dc_id: int, count: int) -> list[MTProtoSender]:
     """Create a pool of MTProtoSenders for downloading from a specific DC."""
-    # Ensure client has auth for this DC by borrowing an exported sender
-    borrowed = await client._borrow_exported_sender(dc_id)
-    auth_key = borrowed.auth_key
+    if dc_id == client.session.dc_id:
+        auth_key = client.session.auth_key
+    else:
+        # Ensure client has auth for this DC by borrowing an exported sender
+        borrowed = await client._borrow_exported_sender(dc_id)
+        auth_key = borrowed.auth_key
     
     dc = await client._get_dc(dc_id)
     senders = []
