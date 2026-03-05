@@ -19,9 +19,10 @@ This project has been rewritten from the ground up to solve the most difficult b
 
 - 🚀 **FastTelethon Parallel Chunking**: Uses hardware-accelerated C-bindings (`cryptg`) and multi-connection streaming to smash Telegram's 1-2 MB/s single-connection limit. Downloads and uploads are now **blazingly fast**.
 - 🤖 **Dual-Client Account Protection**: Safeguard your personal user account from API bans. Configure TML to download deeply hidden messages with your User Session, while simultaneously uploading them to the destination using an immortal Bot Token.
-- ✂️ **Automatic 2GB File Slicing**: Bypasses Telegram's strict 2GB file limit natively in Python. Massive 5GB+ files are split into `.part` chunks in real-time, instantly uploaded, and deleted locally to save your storage drive.
-- �️ **Original Filename Restoration**: Your files won't end up as random `4523.rar`. TML meticulously hooks into Telegram's invisible `DocumentAttributeFilename` records to extract and restore the **exact** original filename uploaded by the original user.
-- ⚡ **Asynchronous Streaming**: You don't have to wait for a 100GB backup to finish downloading before uploading begins. TML downloads the next file while the previous file is still uploading to the destination API.
+- ✂️ **Automatic 2GB File Slicing**: Bypasses Telegram's strict 2GB file limit natively in Python. Massive 5GB+ files are split into `.part` chunks via async memory buffering, instantly uploaded, and deleted locally to save your storage drive.
+- 🔄 **Smart Resume**: Accidental server crash? TML maintains a unified JSON log. Upon restart, it instantly skips fully uploaded files and avoids re-downloading existing media, saving you hundreds of gigabytes in bandwidth.
+- 📊 **Live Telegram Tracker**: Send `/status` to your configured Bot to view a beautifully formatted, auto-refreshing progress bar (WZML-X style) showing active transfers, speeds, and ETAs in real time.
+- ⚡ **Selectable Engine Pipelines**: Choose between **Direct Memory Streaming** (pipes data from source server directly to destination server without touching your hard drive) or **Local Disk Backup** (caches files securely before uploading).
 
 ---
 
@@ -85,18 +86,41 @@ If you provide a `BOT_TOKEN`, the script creates two separate persistent session
 You can run the Unified Sync tool in Interactive Mode, or skip all questions by passing CLI flags for fully automated server orchestration!
 
 ### Interactive Mode
+TML features a beautifully designed interactive Terminal Interface.
 ```bash
 python -m src.backup
 ```
 
 ### Automated CLI Mode
 ```bash
-python -m src.backup --mode 1 --min-id 0 --max-id 0 --auto-resend
+python -m src.backup --mode 1 --min-id 0 --max-id 0 --auto-resend --stream
 ```
-* **Modes**: `1` (Export All), `2` (Only Media), `3` (Only Text)
-* **Auto-resend**: Streams the backup pipeline live to your `DESTINATION_GROUP_ID`.
+* **`--mode`**: `1` (Export All), `2` (Only Media), `3` (Only Text)
+* **`--auto-resend`**: Triggers the upload pipeline to your `DESTINATION_GROUP_ID`.
+* **`--stream`**: Forces Direct Memory Streaming (skips saving to local disk).
+* **`--disk`**: Forces Local Disk Backup (caches files to hard drive first).
 
 *(Note: On your very first run, TML will ask for your Telegram phone number and 2FA code to generate your local `tg_session.session` file. You will not have to login again.)*
+
+---
+
+## 📊 Live Progress Tracker (`/status`)
+
+If you provided a `BOT_TOKEN` in your `.env`, TML binds a command listener to it. 
+Simply open Telegram and send `/status` to your bot.
+
+It will instantly reply with an **auto-refreshing live progress board** detailing every active download, split, and upload happening on your server:
+
+```text
+1. Massive_Course_Video.mp4
+┟ [⬢⬢⬢⬢⬢⬢⬡⬡⬡⬡⬡⬡] 50.0%
+┠ Processed → 975.00MB of 1.95GB
+┠ Status → Uploading
+┠ Speed → 12.50MB/s
+┠ Time → 1m18s elapsed ( ETA 1m18s )
+┖ Engine → FastTelethon
+```
+*(The message automatically updates itself every 5-seconds until all transfers complete!)*
 
 ---
 
