@@ -381,7 +381,13 @@ async def export_messages(
                                 break
                     
                     file_path = os.path.join(output_folder, real_filename)
-                    if auto_resend and dest_group_id and upload_client and use_stream:
+
+                    file_size = getattr(event.old.media.document, 'size', 0) if hasattr(event.old.media, 'document') and event.old.media.document else 0
+                    is_eligible_for_stream = use_stream and (file_size <= MAX_FILE_SIZE)
+                    if use_stream and file_size > MAX_FILE_SIZE:
+                        print(f"[Streamer] File {real_filename} is > 2GB ({(file_size/(1024**3)):.2f}GB). Falling back to disk storing and splitting.")
+
+                    if auto_resend and dest_group_id and upload_client and is_eligible_for_stream:
                         print(f"[Streamer] Streaming media for ID {event.old.id} as {real_filename} directly to destination...")
                         dest_entity = await upload_client.get_entity(PeerChannel(dest_group_id))
                         # Build caption from original message so it's sent WITH the file
@@ -420,7 +426,13 @@ async def export_messages(
                             break
                             
                 file_path = os.path.join(output_folder, real_filename)
-                if auto_resend and dest_group_id and upload_client and use_stream:
+
+                file_size = getattr(event.old.media.document, 'size', 0) if hasattr(event.old.media, 'document') and event.old.media.document else 0
+                is_eligible_for_stream = use_stream and (file_size <= MAX_FILE_SIZE)
+                if use_stream and file_size > MAX_FILE_SIZE:
+                    print(f"[Streamer] File {real_filename} is > 2GB ({(file_size/(1024**3)):.2f}GB). Falling back to disk storing and splitting.")
+
+                if auto_resend and dest_group_id and upload_client and is_eligible_for_stream:
                     print(f"[Streamer] Streaming media for ID {event.old.id} as {real_filename} directly to destination...")
                     dest_entity = await upload_client.get_entity(PeerChannel(dest_group_id))
                     stream_caption = _build_caption(event_dict)

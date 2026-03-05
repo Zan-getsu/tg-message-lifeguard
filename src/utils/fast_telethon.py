@@ -337,48 +337,36 @@ async def stream_transfer(
 
 
 # ---------------------------------------------------------------------------
+#  Parallel Download Pool
+# ---------------------------------------------------------------------------
+async def _create_download_pool(client: TelegramClient, dc_id: int, count: int) -> list[MTProtoSender]:
+    """Create a pool of MTProtoSenders for downloading from a specific DC."""
+    # Ensure client has auth for this DC by borrowing an exported sender
+    borrowed = await client._borrow_exported_sender(dc_id)
+    auth_key = borrowed.auth_key
+    
+    dc = await client._get_dc(dc_id)
+    senders = []
+    
+    async def create_one():
+        sender = MTProtoSender(auth_key, loggers=client._log)
+        await sender.connect(
+            client._connection(
+                dc.ip_address, dc.port, dc.id, loggers=client._log, proxy=client._proxy
+            )
+        )
+        return sender
+        
+    senders = await asyncio.gather(*(create_one() for _ in range(count)))
+    return list(senders)
+
+
+# ---------------------------------------------------------------------------
 #  Parallel Download
 # ---------------------------------------------------------------------------
-async def _download_worker(
-    client: TelegramClient,
-    file_obj,
-    offset: int,
-    chunk_size: int,
-    file_handle,
-    tracker_name: str,
-    max_retries: int = 3,
-):
-    """Downloads a specific chunk with retry logic."""
-    for attempt in range(max_retries):
-        try:
-            async for chunk in client.iter_download(
-                file_obj, offset=offset, request_size=chunk_size, limit=1
-            ):
-                file_handle.seek(offset)
-                file_handle.write(chunk)
-                tracker.update_task(tracker_name, len(chunk))
-            return
-        except Exception as e:
-            if attempt < max_retries - 1:
-                wait = 1 * (attempt + 1)
-                print(
-                    f"[FastTelethon] Retry {attempt+1}/{max_retries} for offset "
-                    f"{offset}: {e}  (waiting {wait}s)"
-                )
-                await asyncio.sleep(wait)
-            else:
-                print(
-                    f"[FastTelethon] Error downloading chunk at offset {offset} "
-                    f"after {max_retries} attempts: {e}"
-                )
-                raise
-
-
 async def parallel_download(client: TelegramClient, media_obj, file_path: str):
     """
-    Downloads a media document in parallel chunks.
-    Pass a Message object as media_obj whenever possible so Telethon can
-    auto-refresh expired file references.
+    Downloads a media document truly in parallel using multiple TCP connections.
     """
     document = media_obj
     if hasattr(document, 'media') and document.media is not None:
@@ -391,54 +379,74 @@ async def parallel_download(client: TelegramClient, media_obj, file_path: str):
             else getattr(document, 'photo', document)
         )
 
-    if isinstance(document, Document):
-        size = document.size
-    elif isinstance(document, Photo):
-        largest_size = max(
-            document.sizes,
-            key=lambda s: getattr(s, 'size', 0) if hasattr(s, 'size') else 0,
-        )
-        size = getattr(largest_size, 'size', 0)
+    if isinstance(document, Document) or isinstance(document, Photo):
+        # We can extract true info via client
+        info = await client._get_file_info(media_obj)
+        dc_id, location = info.dc_id, info.location
+        size = info.size
     else:
         return await client.download_media(media_obj, file_path)
 
-    if size <= 0:
-        print("[FastTelethon] File size is 0, using standard download fallback.")
+    if size <= 10 * 1024 * 1024:
+        print(f"[FastTelethon] File is small ({size / 1024 / 1024:.2f} MB), using standard optimized download.")
         return await client.download_media(media_obj, file_path)
 
     base_name = os.path.basename(file_path)
     tracker.init_task(base_name, size, "Downloading")
     print(f"[FastTelethon] Starting parallel download of {size / (1024*1024):.2f} MB to {file_path}")
+    print(f"[FastTelethon] Using {DOWNLOAD_WORKERS} parallel download connections.")
 
+    senders = []
     try:
+        from telethon.tl.functions.upload import GetFileRequest
+        senders = await _create_download_pool(client, dc_id, DOWNLOAD_WORKERS)
+        
+        sem = asyncio.Semaphore(len(senders) * 3)
+        pending: list[asyncio.Task] = []
+        
+        async def _download_chunk(sender: MTProtoSender, offset: int, limit: int, file_handle):
+            req = GetFileRequest(location=location, offset=offset, limit=limit)
+            for attempt in range(4):
+                try:
+                    result = await sender.send(req)
+                    chunk_data = result.bytes
+                    
+                    file_handle.seek(offset)
+                    file_handle.write(chunk_data)
+                    tracker.update_task(base_name, len(chunk_data))
+                    break
+                except Exception as e:
+                    if attempt == 3: raise
+                    await asyncio.sleep(1 + attempt)
+            sem.release()
+            
         with open(file_path, "wb") as f:
-            # Pre-allocate file size
             f.seek(size - 1)
             f.write(b"\0")
             f.seek(0)
-
-            tasks = []
+            
+            chunk_index = 0
             for offset in range(0, size, CHUNK_SIZE):
-                task = _download_worker(
-                    client, media_obj, offset, CHUNK_SIZE, f, base_name
-                )
-                tasks.append(task)
-
-                if len(tasks) >= DOWNLOAD_WORKERS:
-                    await asyncio.gather(*tasks)
-                    tasks.clear()
-                    if USER_SAFE_DELAY:
-                        await asyncio.sleep(random.uniform(0.2, 0.6))
-
-            if tasks:
-                await asyncio.gather(*tasks)
+                await sem.acquire()
+                limit = min(CHUNK_SIZE, size - offset)
+                
+                sender = senders[chunk_index % len(senders)]
+                task = asyncio.create_task(_download_chunk(sender, offset, limit, f))
+                pending.append(task)
+                chunk_index += 1
+                
+            if pending:
+                await asyncio.gather(*pending)
 
     except Exception as e:
         print(f"[FastTelethon] Download failed for {base_name}: {e}")
         tracker.complete_task(base_name)
         raise
+    finally:
+        tracker.complete_task(base_name)
+        if senders:
+            await asyncio.gather(*(s.disconnect() for s in senders), return_exceptions=True)
 
-    tracker.complete_task(base_name)
     print(f"[FastTelethon] Download complete.")
     return file_path
 
@@ -482,18 +490,28 @@ async def parallel_upload(client: TelegramClient, file_path: str):
     try:
         senders = await _create_upload_pool(client, UPLOAD_CONNECTIONS)
 
-        sem = asyncio.Semaphore(len(senders) * 4)
+        sem = asyncio.Semaphore(len(senders) * 3)
         pending: list[asyncio.Task] = []
 
         async def _send_part(sender: MTProtoSender, req, n_bytes: int) -> None:
-            async with sem:
-                await sender.send(req)
-            tracker.update_task(file_name, n_bytes)
+            for attempt in range(4):
+                try:
+                    await sender.send(req)
+                    tracker.update_task(file_name, n_bytes)
+                    break
+                except Exception as e:
+                    if attempt == 3: raise
+                    await asyncio.sleep(1 + attempt)
+            sem.release()
 
         with open(file_path, "rb") as f:
             for i in range(part_count):
+                # Acquire sem BEFORE reading chunk so we don't hold the whole file in memory
+                await sem.acquire()
+                
                 chunk_data = f.read(CHUNK_SIZE)
                 if not chunk_data:
+                    sem.release()
                     break
 
                 req = SaveBigFilePartRequest(
@@ -506,6 +524,9 @@ async def parallel_upload(client: TelegramClient, file_path: str):
                 sender = senders[i % len(senders)]
                 task = asyncio.create_task(_send_part(sender, req, len(chunk_data)))
                 pending.append(task)
+                
+                # yield to loop to allow active transfers
+                await asyncio.sleep(0)
 
         # Wait for all in-flight parts
         if pending:
